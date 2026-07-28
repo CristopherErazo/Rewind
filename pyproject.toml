@@ -1,0 +1,22 @@
+[project]
+name = "rewind"
+version = "0.1.0"
+description = "Small library for turning a training loop into something you can steer while it runs."
+authors = [
+    { name = "Cristopher Erazo", email = "cerazova@sissa.it" }
+]
+dynamic = ["dependencies"] 
+
+[build-system]
+requires = ["setuptools"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find] 
+where = ["."] 
+exclude = ["scripts", "shell","notebooks"] 
+
+[tool.setuptools.dynamic] 
+dependencies = { file = ["requirements.txt"] } 
+
+[project.optional-dependencies] 
+test = ["pytest"]
