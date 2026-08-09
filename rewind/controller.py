@@ -10,15 +10,32 @@ side, with no changes needed here.
 """
 
 import time
+from typing import Callable
 
-from rewind.snapshot import SnapshotManager
-from rewind.protocols import TrackingHandle, ControlHandle
-from rewind.snapshot import SnapshotManager
-from rewind.control import _NullControl
+from .snapshot import SnapshotManager
+from .protocols import TrackingHandle, ControlHandle
+from .control import _NullControl, RunStatus
+
+from .registry import ActionSpec, BUILTIN_ACTIONS, write_actions
+from ._fsutil import atomic_write
+from ._layout import status_path
+
+
 
 
 EVAL_ARTIFACTS_GROUP = "eval_artifacts"
 
+def _handle_pause(self, cmd):
+    self.paused = True
+    self.status.update(paused=True)
+
+def _handle_resume(self, cmd):
+    self.paused = False
+    self.status.update(paused=False)
+
+def _handle_stop(self, cmd):
+    self.status.update(running=False, done=True)
+    self._stop = True
 
 def _handle_set_lr(controller, cmd):
     """Set the learning rate of all param groups to cmd['lr']."""
@@ -33,7 +50,6 @@ def _handle_rewind(controller, cmd):
     # Find the nearest snapshot at or before the requested step. This will be a TrainerState object.
     # The nearest_before method will walk the lineage of branches to find the correct snapshot.
     if controller.enable_rewind is False:
-        controller.logger.error("rewind is disabled; construct with enable_rewind=True")
         # raise exception
         raise RuntimeError("rewind is disabled; construct with enable_rewind=True")
     snap = controller.snapshots.nearest_before(cmd["step"], controller.branch_id)
@@ -101,25 +117,32 @@ class TrainerController:
         self.step = 0
         self.paused = False
         self.branch_id = "root"
-        self._branch_counter = 0
         self.eval_schedule: set[int] = set()
         self.eval_artifacts_schedule: set[int] = set()
+
+        self._branch_counter = 0
         self._stop = False
+        self._specs : list[ActionSpec] = list(BUILTIN_ACTIONS)
         self._handlers: dict[str, callable] = {}
         self._register_builtin_handlers()
 
+        self.status = RunStatus(run.run_dir)
+       
+
     # ---------------- extension point for project-specific commands ----------------
-    def register_handler(self, cmd_type: str, handler):
+    def register_handler(self, cmd_type : str, handler : Callable, spec: ActionSpec | None = None) -> None :
         """handler(controller, cmd) -> None. Anything not built into rewind
         gets registered here by the project -- rewind never needs to know
         what it does, only that it exists."""
         self._handlers[cmd_type] = handler
-
+        if spec is not None: 
+            self._specs.append(spec)
+            
     def _register_builtin_handlers(self):
         handlers = {
-            "pause":  lambda c, cmd: setattr(c, "paused", True),
-            "resume": lambda c, cmd: setattr(c, "paused", False),
-            "stop":   lambda c, cmd: setattr(c, "_stop", True),
+            "pause":  _handle_pause,
+            "resume": _handle_resume,
+            "stop":   _handle_stop,
             "set_lr": _handle_set_lr,
         }
         if self.snapshots is not None:
@@ -159,8 +182,9 @@ class TrainerController:
             return
         try:
             handler(self, cmd)
-        except Exception:
+        except Exception as e:
             self.logger.exception(f"command {cmd_type!r} failed at step {self.step}, ignoring")
+            self.logger.exception(f"{e}")
             self.run.track_metric(self.step, tags=self._branch_tags(),
                                    note=f"command failed: {cmd_type}", event=cmd)
             return
@@ -204,15 +228,16 @@ class TrainerController:
     def run_loop(self):
         self.logger.info(f"starting training | run_id={self.run.run_id} | "
                           f"total_steps={self.total_steps}")
-        self.run.set_status(step=0, branch_id=self.branch_id, running=True, paused=False)
+        
+        write_actions(self.run.run_dir, self._specs)
+        self.status.update(step=0, branch_id=self.branch_id, running=True, paused=False, done=False)
 
         while self.step < self.total_steps and not self._stop:
             for cmd in self.control.poll_commands():
                 self._apply(cmd)
 
             if self.paused:
-                self.run.set_status(step=self.step, branch_id=self.branch_id,
-                                         running=True, paused=True)
+                self.status.update(paused=True)
                 time.sleep(0.1)
                 continue
 
@@ -220,8 +245,6 @@ class TrainerController:
                 metrics = self.eval_fn()
                 self.run.track_metric(self.step, tags=self._branch_tags(), **metrics)
                 self._log_eval(metrics)
-                self.run.set_status(step=self.step, branch_id=self.branch_id, 
-                                        running=True, paused=False)
 
             if self.eval_art_fn is not None and self.step in self.eval_artifacts_schedule:
                 self._log_eval_artifacts(self.eval_art_fn())
@@ -234,8 +257,12 @@ class TrainerController:
 
             self.train_step_fn()
             self.step += 1
+            self.status.update(step=self.step) 
+            # To be changed potentially
+            # if self.step % self.status_every == 0: self.status.update(step=self.step)  
+            # # e.g. status_every = 10, a new __init__ param
+                
 
         self.logger.info(f"training finished at step {self.step} (branch={self.branch_id})")
-        self.run.set_status(step=self.step, branch_id=self.branch_id,
-                                 running=False, paused=False, done=True)
+        self.status.update(running=False, paused=False, done=True)
         self.run.finalize()
