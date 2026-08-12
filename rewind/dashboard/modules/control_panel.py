@@ -42,15 +42,25 @@ def _action_ui(spec: ActionSpec):
 def control_panel_ui():
     # Populated dynamically server-side, since the action list isn't known
     # until a run is selected and it has written its actions.json.
-    return ui.card(ui.card_header("Controls"), ui.output_ui("actions_container"))
+    return ui.card(ui.card_header("Controls"), 
+                   ui.output_text("counter"),
+                   ui.output_ui("actions_container"))
 
 
 @module.server
 def control_panel_server(input, output, session, run_dir: reactive.Calc):
+    # @reactive.calc
+    # def specs() -> list[ActionSpec]:
+    #     rd = run_dir()
+    #     return read_actions(Path(rd)) if rd else []
+
     @reactive.calc
     def specs() -> list[ActionSpec]:
+        reactive.invalidate_later(1.0)   # keep re-reading actions.json until it exists, then keep it fresh
         rd = run_dir()
-        return read_actions(Path(rd)) if rd else []
+        result =  read_actions(Path(rd)) if rd else []
+        # print(f"[specs] run_dir={rd}, n_specs={len(result)}")   # <-- add this
+        return result
 
     @render.ui
     def actions_container():
@@ -73,22 +83,36 @@ def control_panel_server(input, output, session, run_dir: reactive.Calc):
 
     @reactive.effect
     def _dispatch():
+        # print(f"[_dispatch] fired, run_dir={run_dir()}")   # <-- add this
         mb = mailbox()
         if mb is None:
+            print("[_dispatch] mailbox is None, returning")   # <-- add this
             return
-
-        last = _last_counts.get()
+        with reactive.isolate():
+            last = _last_counts.get()
+        # last = _last_counts.get()
         updated = dict(last)
         for spec in specs():
             if not hasattr(input, spec.html_id):
+                print(f"[_dispatch] no input attr for {spec.html_id}")   # <-- add this
                 continue
             count = getattr(input, spec.html_id)()
+            # print(f"[_dispatch] {spec.html_id}: count={count}, last={last.get(spec.html_id, 0)}")   # <-- add this
+            if count != last.get(spec.html_id, 0):
+                print(f"[_dispatch] {spec.html_id}: {last.get(spec.html_id, 0)} -> {count}")
+        
             if count > last.get(spec.html_id, 0):
                 with reactive.isolate():
                     args = {
                         arg_name: getattr(input, spec.arg_html_id(arg_name))()
                         for arg_name in spec.args
                     }
+                print(f"[_dispatch] SENDING: {spec.name}")
+                # print(f"[_dispatch] sending command: {spec.name}")   # <-- add this
                 mb.send_command({"type": spec.name, **args})
             updated[spec.html_id] = count
         _last_counts.set(updated)
+
+    @render.text
+    def counter():
+        return f'N counts = {_last_counts.get()}'

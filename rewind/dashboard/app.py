@@ -191,17 +191,31 @@ def build_dashboard(cfg: DashboardConfig) -> App:
     return App(app_ui, server)
 
 
+# def _poll_once(run_dir: Path | None) -> dict:
+#     if run_dir is None:
+#         return {"metrics": None, "status": None}
+#     stream = _get_stream(run_dir)
+#     # status.json is Rewind's file now (rewind/control/status.json), not
+#     # TrackLab's -- read it directly rather than through MetricsStream,
+#     # which only knows about metrics.jsonl.
+#     sp = status_path(run_dir)
+#     # status = json.loads(sp.read_text()) if sp.exists() else None
+#     try:
+#         status = json.loads(sp.read_text()) if sp.exists() else None
+#     except (FileNotFoundError, json.JSONDecodeError):
+#         status = None
+#     return {"metrics": stream.poll(), "status": status}
+
 def _poll_once(run_dir: Path | None) -> dict:
     if run_dir is None:
         return {"metrics": None, "status": None}
     stream = _get_stream(run_dir)
-    # status.json is Rewind's file now (rewind/control/status.json), not
-    # TrackLab's -- read it directly rather than through MetricsStream,
-    # which only knows about metrics.jsonl.
     sp = status_path(run_dir)
-    # status = json.loads(sp.read_text()) if sp.exists() else None
     try:
         status = json.loads(sp.read_text()) if sp.exists() else None
     except (FileNotFoundError, json.JSONDecodeError):
         status = None
-    return {"metrics": stream.poll(), "status": status}
+
+    metrics_df = stream.poll()
+    metrics = metrics_df.to_dict("records")  # list[dict] -- comparable, satisfies reactive.poll
+    return {"metrics": metrics, "status": status}

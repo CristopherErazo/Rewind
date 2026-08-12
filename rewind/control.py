@@ -52,6 +52,7 @@ class RunMailbox:
     def send_command(self, cmd: dict):
         """Write a command to the mailbox. The training process will pick it up on its next poll and act on it."""
         path = self.commands_dir / f"{time.time_ns()}.json"
+        print(f"[send_command] writing {path}")   # <-- add this
         atomic_write(path, json.dumps(cmd))
 
     def poll_commands(self) -> list[dict]:
