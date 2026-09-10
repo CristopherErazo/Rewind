@@ -1,14 +1,14 @@
 """rewind/dashboard/config.py
 
-DashboardConfig bundles everything the engine needs to know about a
-project. A new project's entire dashboard is:
+DashboardConfig bundles everything the dashboard needs to know about a
+project. The minimum is a base directory:
 
-    from rewind.dashboard import build_dashboard, DashboardConfig
-    app = build_dashboard(DashboardConfig(
-        base_dir="./data",
-        config_cls=TrainerArgs,
-        entrypoint="my_project.launcher",
-    ))
+    app = build_dashboard(DashboardConfig(base_dir="./data"))
+
+That gives an attach-first dashboard: pick an experiment and a run that is
+already training (started from a terminal, a notebook, anywhere) and steer
+it. Launching new runs from the UI is optional and needs both `config_cls`
+(to build the form) and `entrypoint` (to spawn the process).
 """
 
 from __future__ import annotations
@@ -21,51 +21,43 @@ from .schema import FieldSpec
 
 
 class DashboardExtension(Protocol):
-    """A project-supplied panel that doesn't fit the generic form/plot mold
-    (design doc, "Metrics panel: sensible default + extension slots"). It's
-    just another Shiny module, mounted as one extra tab -- no plugin
-    machinery beyond "put it in this list"."""
+    """A project-supplied tab. Just another Shiny module mounted as one
+    extra nav panel. Ids inside an extension must be unique across the whole
+    app (extensions are not namespaced yet)."""
 
     id: str
     label: str
 
     def ui(self) -> Any: ...
 
-    def server(self, input, output, session, ctx: RunContext) -> None: ...
+    def server(self, input, output, session, ctx: "RunContext") -> None: ...
 
 
 @dataclass
 class RunContext:
-    """Handles an extension typically needs -- the same reader machinery the
-    built-in panels use, nothing extension-specific added on top.
+    """What an extension's server() receives. Every field is a zero-arg
+    reactive callable, so reading it inside a render/calc/effect stays
+    reactive and re-fires when the active run changes."""
 
-    All three fields are zero-arg callables (in practice, the app's own
-    reactive.Calc objects), the same convention every built-in module
-    already uses (see e.g. control_panel_server's `run_dir: reactive.Calc`
-    parameter). Reading ctx.run_dir() inside a @render/@reactive.calc/
-    @reactive.effect stays reactive -- it re-fires when the selected run
-    changes. A RunContext holding already-resolved values instead would
-    freeze at whatever was active the moment the extension's server()
-    function ran (once, at session start), never updating again.
-
-    Known limitation: extensions are mounted directly, not wrapped in their
-    own Shiny module/namespace, so any Shiny input/output id an extension
-    defines (e.g. via ui.output_text_verbatim("foo")) must be unique across
-    the whole app, not just within the extension. Fine for one or two
-    extensions; worth revisiting with proper per-extension namespacing if
-    that ever becomes a real collision instead of a documented constraint.
-    """
-
-    reader: Callable[[], Any]  # () -> tracklab.ExperimentReader, for the selected experiment
-    run_dir: Callable[[], Path | None]  # () -> active run_dir, or None if nothing's selected
-    mailbox: Callable[[], Any | None]  # () -> rewind.control.RunMailbox bound to run_dir, or None
+    reader: Callable[[], Any]              # () -> tracklab.ExperimentReader for the selected experiment
+    run_dir: Callable[[], Path | None]     # () -> active run_dir, or None
+    mailbox: Callable[[], Any | None]      # () -> rewind.RunMailbox bound to run_dir, or None
+    status: Callable[[], dict | None]      # () -> parsed control/status.json, or None
+    metrics: Callable[[], list[dict]]      # () -> metric rows (long format) for the active run
+    events: Callable[[], list[dict]]       # () -> control/events.jsonl rows
 
 
 @dataclass
 class DashboardConfig:
     base_dir: Path
-    config_cls: type  # e.g. TrainerArgs -- introspected by schema.form_fields
-    entrypoint: str  # "python -m <entrypoint> ..." target for RunLauncher
+    config_cls: type | None = None         # project config dataclass; enables the launch form
+    entrypoint: str | None = None          # "python -m <entrypoint>" target; enables launching
     field_overrides: dict[str, Callable[[FieldSpec], Any]] = field(default_factory=dict)
     extensions: list[DashboardExtension] = field(default_factory=list)
-    poll_interval_s: float = 1.0
+    poll_interval_s: float = 1.0           # live files of the active run
+    listing_interval_s: float = 2.0        # experiment / run directory listings
+    title: str = "Rewind"
+
+    @property
+    def launchable(self) -> bool:
+        return self.config_cls is not None and bool(self.entrypoint)

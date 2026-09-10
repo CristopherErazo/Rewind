@@ -1,55 +1,29 @@
-"""rewind.dashboard -- a project-agnostic Shiny UI for launching, watching,
-and steering a run through Rewind's control plane.
+"""rewind.dashboard -- a Shiny UI for attaching to, watching and steering a
+run through Rewind's control plane. Requires the `dashboard` extra
+(tracklab, shiny, shinywidgets, plotly, pandas).
 
-The only function most projects ever need:
+Minimal, attach-only:
 
     from rewind.dashboard import build_dashboard, DashboardConfig
+    app = build_dashboard(DashboardConfig(base_dir="./data"))
 
-Everything project-specific comes in through DashboardConfig; everything
-else (experiment picker, launch form, runs table, live metrics, control
-panel) is generic and works unmodified across projects. See
-build_dashboard()'s docstring in app.py for the full contract, or
-icl/scripts/dashboard_basic.py for the minimal working example.
+With launching enabled (form generated from a config dataclass):
 
-Public API
-----------
-build_dashboard(cfg) -> shiny.App   The one entrypoint. Assign the result to
-                                     a module-level `app` and run with
-                                     `shiny run --reload <script>`.
-DashboardConfig                     The contract a project fills in.
-DashboardExtension                  Protocol for a custom tab (see config.py).
-RunContext                          What a DashboardExtension's server() receives.
-RunLauncher, ProcessRecord, LaunchError
-                                     Subprocess lifecycle -- usable directly,
-                                     without Shiny, e.g. from a script or the
-                                     `rewind` CLI.
-ActionSpec, ArgSpec, read_actions, write_actions
-                                     The self-describing control registry.
-FieldSpec, form_fields, input_id
-                                     Config-dataclass introspection behind
-                                     the auto-generated launch form.
+    app = build_dashboard(DashboardConfig(
+        base_dir="./data", config_cls=TrainerArgs, entrypoint="my_project.launcher"))
+
+Run with `shiny run --reload path/to/script.py`.
 """
 
 from .app import build_dashboard
 from .config import DashboardConfig, DashboardExtension, RunContext
+from .schema import FieldSpec, form_fields, input_id
 from ..launch import LaunchError, ProcessRecord, RunLauncher, write_handshake
 from ..registry import ActionSpec, ArgSpec, read_actions, write_actions
-from .schema import FieldSpec, form_fields, input_id
 
 __all__ = [
-    "build_dashboard",
-    "DashboardConfig",
-    "DashboardExtension",
-    "RunContext",
-    "RunLauncher",
-    "ProcessRecord",
-    "LaunchError",
-    "write_handshake",
-    "ActionSpec",
-    "ArgSpec",
-    "read_actions",
-    "write_actions",
-    "FieldSpec",
-    "form_fields",
-    "input_id",
+    "build_dashboard", "DashboardConfig", "DashboardExtension", "RunContext",
+    "RunLauncher", "ProcessRecord", "LaunchError", "write_handshake",
+    "ActionSpec", "ArgSpec", "read_actions", "write_actions",
+    "FieldSpec", "form_fields", "input_id",
 ]

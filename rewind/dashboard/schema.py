@@ -97,6 +97,3 @@ def _label(name: str) -> str:
     return name.replace("_", " ").capitalize()
 
 
-if __name__ == "__main__":
-    from icl import TrainerArgs
-    fields = form_fields(TrainerArgs)

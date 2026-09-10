@@ -1,16 +1,13 @@
 """rewind/dashboard/modules/launcher_form.py
 
 Renders the launch form from DashboardConfig.config_cls via
-schema.form_fields() -- no hand-maintained widget list, no parallel
-"which override does this widget map to" dict. A project overrides how a
-*specific* field renders via DashboardConfig.field_overrides; every other
-field is fully automatic.
-
-Owns the actual RunLauncher.launch() call, since "submit this form" and
-"spawn the subprocess" are the same action from the user's point of view.
+schema.form_fields() and owns the RunLauncher.launch() call. Only mounted
+when DashboardConfig.launchable is True.
 """
 
 from __future__ import annotations
+
+from typing import Callable
 
 from shiny import module, reactive, render, ui
 
@@ -44,10 +41,8 @@ def launcher_form_ui(cfg: DashboardConfig):
     return ui.card(
         ui.card_header("Launch a new run"),
         ui.accordion(
-            *[
-                ui.accordion_panel(name.replace("_", " ").title(), *widgets)
-                for name, widgets in sections.items()
-            ],
+            *[ui.accordion_panel(name.replace("_", " ").title(), *widgets)
+              for name, widgets in sections.items()],
             open=False,
         ),
         ui.input_action_button("launch_btn", "Launch run", class_="btn-primary"),
@@ -56,38 +51,29 @@ def launcher_form_ui(cfg: DashboardConfig):
 
 
 @module.server
-def launcher_form_server(input, output, session, cfg: DashboardConfig, experiment_name, on_launched):
-    """
-    experiment_name: zero-arg callable (typically the reactive.calc returned
-        by experiment_picker_server) giving the currently selected/typed name.
-    on_launched: callback(RunLauncher) invoked once a run is successfully
-        launched, so the parent app can start watching it.
-    """
+def launcher_form_server(input, output, session, cfg: DashboardConfig,
+                         experiment_name: Callable[[], str | None],
+                         on_launched: Callable[[RunLauncher], None]):
     fields = form_fields(cfg.config_cls)
     status = reactive.value("")
 
     @reactive.effect
-    @reactive.event(input.launch_btn)
+    @reactive.event(input.launch_btn, ignore_init=True)
     def _launch():
         exp_name = experiment_name()
         if not exp_name:
             status.set("Pick or name an experiment first.")
             return
-
-        overrides = {f.path: getattr(input, input_id(f.path))() for f in fields}
-
+        overrides = {f.path: input[input_id(f.path)]() for f in fields}
         launcher = RunLauncher(exp_name, cfg.base_dir, entrypoint=cfg.entrypoint)
         status.set("Launching...")
         try:
-            # Note: this blocks the Shiny session briefly while it waits for
-            # the subprocess's run_id handshake (typically well under a
-            # second). If that ever becomes noticeable, wrap this call in
-            # @reactive.extended_task -- not needed for the baseline.
+            # Blocks the session while waiting for the child's run_id
+            # handshake (usually well under a second; 30s worst case).
             record = launcher.launch(overrides)
         except LaunchError as e:
             status.set(f"Launch failed: {e}")
             return
-
         status.set(f"Launched {record.run_id} (pid {record.pid})")
         on_launched(launcher)
 
