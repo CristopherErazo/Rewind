@@ -4,7 +4,7 @@ The canonical location of everything Rewind owns inside a TrackLab run_dir.
 
 TrackLab owns run_dir's root (config.json, metrics.jsonl, artifacts/, logs/)
 and knows nothing about Rewind. Everything Rewind adds -- the command
-mailbox, the action registry, run status, the future audit journal, and the
+mailbox, the action registry, run status, the audit journal, and the
 launcher's process record -- lives under one `control/` subfolder instead of
 as loose files at run_dir root. This folder only exists for runs that
 actually have the control plane enabled; a bare TrackLab Run never creates
@@ -38,8 +38,8 @@ def actions_path(run_dir: Path) -> Path:
 
 
 def events_path(run_dir: Path) -> Path:
-    """Not written yet -- reserved for the audit journal (see the earlier
-    review's note on separating command history from metrics.jsonl)."""
+    """Audit journal (rewind/events.py): applied/failed commands, forks and
+    lifecycle transitions, kept out of the tracker's metrics table."""
     return control_dir(run_dir) / "events.jsonl"
 
 

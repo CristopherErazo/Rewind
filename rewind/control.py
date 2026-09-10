@@ -1,33 +1,67 @@
+"""rewind/control.py
+
+The control plane's two file-backed halves plus the run state vocabulary.
+
+RunStatus   trainer -> dashboard, one writer, many readers. `control/status.json`.
+RunMailbox  dashboard -> trainer, many writers, one reader. `control/commands/`.
+RunState    the closed set of values `status["state"]` can take.
 """
-Module for controlling a training run via a mailbox of files in a directory. 
-The RunMailbox class provides methods to set and get the status of the run, 
-send commands to the run, and poll for commands sent to the run. 
-The NullControl class is an inert control channel that does not allow any commands to be sent or received.
-"""
+
+from __future__ import annotations
 
 import json
 import os
 import time
+from enum import Enum
 from pathlib import Path
-from dataclasses import dataclass, field
 
 from ._fsutil import atomic_write
 from ._layout import commands_dir, status_path
 
 
-@dataclass
-class RunStatus:
-    """The one-writer, many-readers counterpart to RunMailbox's
-    many-writers, one-reader inbox. Holds the current status in memory
-    (safe, since only the training process itself ever writes this file)
-    and merges partial updates before each atomic write, so no call site
-    has to remember to preserve fields it isn't touching."""
+class RunState(str, Enum):
+    """Lifecycle of a controlled run. Exactly one of these is in
+    status.json's `state` field at any time.
 
-    run_dir: Path
-    _state: dict = field(default_factory=dict, init=False)
+    running      training steps are being executed
+    paused       loop is idling, still polling commands
+    stopped      a `stop` command ended the run before total_steps
+    done         reached total_steps
+    crashed      train/eval raised; `error` in status carries the message
+    interrupted  KeyboardInterrupt (Ctrl-C) in the training process
+    """
+    RUNNING = "running"
+    PAUSED = "paused"
+    STOPPED = "stopped"
+    DONE = "done"
+    CRASHED = "crashed"
+    INTERRUPTED = "interrupted"
+
+    @property
+    def live(self) -> bool:
+        """True while the process is still in its loop and accepts commands."""
+        return self in (RunState.RUNNING, RunState.PAUSED)
+
+
+LIVE_STATES = frozenset(s.value for s in RunState if s.live)
+
+
+class RunStatus:
+    """Holds the current status in memory (safe: only the training process
+    writes this file), merges partial updates, and rewrites the whole file
+    atomically. Every write stamps `updated_at` so readers can tell a stale
+    file from a live one."""
+
+    def __init__(self, run_dir: Path):
+        self.run_dir = Path(run_dir)
+        self._state: dict = {}
 
     def update(self, **fields) -> None:
+        for k, v in fields.items():
+            if isinstance(v, Enum):
+                fields[k] = v.value
         self._state.update(fields)
+        self._state["updated_at"] = time.time()
         atomic_write(status_path(self.run_dir), json.dumps(self._state, indent=2))
 
     @property
@@ -35,45 +69,76 @@ class RunStatus:
         return dict(self._state)
 
 
+def read_status(run_dir: Path) -> dict | None:
+    """Dashboard-side reader. None if the file is missing or half-written."""
+    path = status_path(run_dir)
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        return None
+
+
 class RunMailbox:
-    """Status board + command mailbox for one run directory. Usable
-    standalone (dashboard, given only a path) or composed inside
-    ControllableRun (training process, given a live Run)."""
+    """Command mailbox for one run directory. Usable standalone (dashboard,
+    given only a path) or handed to TrainerController as its `control`."""
+
+    _seq = 0  # process-wide, see send_command
 
     def __init__(self, run_dir):
         self.run_dir = Path(run_dir)
-        self.status_path = self.run_dir / "status.json"
-        # self.commands_dir = self.run_dir / "commands"
         self.commands_dir = commands_dir(self.run_dir)
         self.commands_dir.mkdir(parents=True, exist_ok=True)
 
+    def send_command(self, cmd: dict) -> None:
+        """Write a command file. The trainer picks it up on its next poll.
 
-
-    def send_command(self, cmd: dict):
-        """Write a command to the mailbox. The training process will pick it up on its next poll and act on it."""
-        path = self.commands_dir / f"{time.time_ns()}.json"
-        print(f"[send_command] writing {path}")   # <-- add this
-        atomic_write(path, json.dumps(cmd))
+        Filenames are `<time_ns>-<pid>-<seq>.json`. The clock alone is not
+        enough: on Windows two back-to-back calls can see the same
+        time_ns(), and the second file would silently overwrite the first.
+        The per-process sequence number breaks ties within one sender, the
+        pid breaks ties between senders."""
+        RunMailbox._seq += 1
+        name = f"{time.time_ns():020d}-{os.getpid()}-{RunMailbox._seq:06d}.json"
+        atomic_write(self.commands_dir / name, json.dumps(cmd))
 
     def poll_commands(self) -> list[dict]:
-        """Read all commands from the mailbox, then delete them. Returns a list of command dicts."""
-        cmds = []
-        # Use key=lambda p: int(p.stem) to sort numerically by the filename
-        sorted_paths = sorted(self.commands_dir.glob("*.json"), key=lambda p: int(p.stem))
-        
-        for path in sorted_paths:
+        """Read all pending commands in send order, deleting them. Cheap when
+        the directory is empty, which is the common case on every step."""
+        try:
+            with os.scandir(self.commands_dir) as it:
+                names = [e.name for e in it if e.name.endswith(".json")]
+        except FileNotFoundError:
+            return []
+        if not names:
+            return []
+
+        def _key(name: str) -> tuple:
+            # numeric order on every dash-separated part; legacy plain
+            # `<time_ns>.json` names still sort correctly
+            parts = name[:-5].split("-")
             try:
-                cmds.append(json.loads(path.read_text()))
-            except json.JSONDecodeError:
+                return tuple(int(x) for x in parts)
+            except ValueError:
+                return (0,)
+
+        cmds = []
+        for name in sorted(names, key=_key):
+            path = self.commands_dir / name
+            try:
+                cmds.append(json.loads(path.read_text(encoding="utf-8")))
+            except (json.JSONDecodeError, OSError):
                 continue
             finally:
                 path.unlink(missing_ok=True)
         return cmds
 
-class _NullControl:
-    """Inert control channel: no commands directory, no status.json,
-    no filesystem writes at all. Used when the user just wants tracking."""
 
-    def send_command(self, cmd: dict):
+class _NullControl:
+    """Inert control channel: no commands directory, no filesystem reads.
+    Used when the user just wants tracking."""
+
+    def send_command(self, cmd: dict) -> None:
         raise RuntimeError("this run has no control channel; construct TrainerController with control=...")
-    def poll_commands(self) -> list[dict]: return []
+
+    def poll_commands(self) -> list[dict]:
+        return []
