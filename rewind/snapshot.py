@@ -1,18 +1,23 @@
-"""
-Two-tier snapshotting, speaking RunHandle instead of any specific tracker:
-  - a small in-memory ring buffer for recent steps (cheap, kept dense)
-  - run.track_artifact(..., type='pickle') for older steps, saved less often
+"""rewind/snapshot.py
 
-Disk snapshot *discovery* isn't something RunHandle exposes generically, so
-this manager tracks which steps it saved to disk itself, in memory -- fine,
-since rewinding only ever happens live, within the same process that did
-the saving.
----
-Two-tier snapshotting, keyed by (branch_id, step) rather than step alone so
-two branches passing through the same step number never collide -- neither
-in the in-memory ring nor in the artifact filenames on disk. Snapshots live
-under their own tracklab artifact group ("trainer_state") so they never
-share an index.csv with eval-time artifacts.
+Two-tier snapshotting, speaking TrackingHandle instead of any specific
+tracker:
+  - a small in-memory ring buffer of TrainerState objects for recent steps
+    (cheap, kept dense)
+  - run.track_artifact(..., type="torch") for older steps, saved less often
+
+Snapshots are keyed by (branch_id, step) rather than step alone so two
+branches passing through the same step number never collide, neither in the
+ring nor in the artifact filenames on disk. Disk snapshots live under their
+own artifact group ("trainer_state") so they never share an index with
+eval-time artifacts.
+
+What goes to disk is `TrainerState.to_dict()`, a plain dict of tensors and
+scalars, never the dataclass itself: `torch.load` defaults to
+`weights_only=True` since PyTorch 2.6 and refuses arbitrary classes. Disk
+snapshot *discovery* is not something TrackingHandle exposes, so the manager
+remembers which (branch, step) pairs it saved, in memory: rewinding only
+ever happens live, in the process that did the saving.
 """
 
 from collections import OrderedDict
@@ -26,6 +31,14 @@ SNAPSHOT_ARTIFACT_NAME = "trainer_state"
 
 
 class SnapshotManager:
+    """First write wins: at most one state is kept per (branch_id, step),
+    and it is the earliest one captured at that step. The loop applies
+    commands before the scheduled snapshot, so a handler's force_snapshot
+    (taken right before it mutates weights) is that earliest state, and a
+    scheduled snapshot at the same step reuses it rather than overwriting it
+    with the post-intervention state. "Rewind to S" therefore always means
+    the state before anything that happened at step S."""
+
     def __init__(self, run: TrackingHandle, ring_size: int = 20,
                  ring_every: int = 10, disk_every: int = 200):
         self.run = run
@@ -47,13 +60,27 @@ class SnapshotManager:
         take_disk = step % self.disk_every == 0
         if not (take_ring or take_disk):
             return
-        state = TrainerState.capture(step, model, optimizer, lr, branch_id)
+        key = (branch_id, step)
+        if key in self._ring:
+            # A handler already snapshotted this step before mutating the
+            # weights (force_snapshot). That is the state *before* the
+            # intervention: keep it, and let it reach disk on a disk step
+            # instead of capturing the post-intervention state under the
+            # same key. See "first write wins" in the class docstring.
+            state = self._ring[key]
+        else:
+            state = TrainerState.capture(step, model, optimizer, lr, branch_id)
         self._store(state, ring=take_ring, disk=take_disk)
 
     def force_snapshot(self, step, model, optimizer, lr, branch_id="root"):
         """Snapshot immediately, regardless of schedule -- for handlers about
         to do something risky (e.g. perturbing weights) that want a
-        guaranteed rewind point right before the change."""
+        guaranteed rewind point right before the change. A second call at
+        the same (branch, step) returns the existing snapshot rather than
+        re-capturing, so the earliest state of the step is the one kept."""
+        key = (branch_id, step)
+        if key in self._ring:
+            return self._ring[key]
         state = TrainerState.capture(step, model, optimizer, lr, branch_id)
         self._store(state, ring=True, disk=False)
         return state
@@ -66,8 +93,8 @@ class SnapshotManager:
                 self._ring.popitem(last=False)
         if disk:
             name = self._scoped_name(state.branch_id)
-            self.run.track_artifact(state, step=state.step, group=SNAPSHOT_GROUP,
-                                     name=name, type="torch")
+            self.run.track_artifact(state.to_dict(), step=state.step, group=SNAPSHOT_GROUP,
+                                    name=name, type="torch")
             self._disk_index.append(key)
 
     def _scoped_name(self, branch_id: str) -> str:
@@ -87,8 +114,9 @@ class SnapshotManager:
             disk_candidates = [k for k in self._disk_index if k[0] == b and k[1] <= upper]
             if disk_candidates:
                 nearest_step = max(k[1] for k in disk_candidates)
-                return self.run.load_artifact(group=SNAPSHOT_GROUP, name=self._scoped_name(b),
-                                               step=nearest_step, type="torch")
+                payload = self.run.load_artifact(group=SNAPSHOT_GROUP, name=self._scoped_name(b),
+                                                 step=nearest_step, type="torch")
+                return TrainerState.from_dict(payload)
 
             if b not in self._lineage:
                 raise KeyError(f"No snapshot at or before step {step} reachable from branch {branch_id!r}")
