@@ -1,118 +1,163 @@
-"""
-TrainerController: owns the training loop and dispatches commands found in
-run.poll_commands() to registered handlers.
+"""rewind/controller.py
 
-Written entirely against RunHandle -- it has no idea tracklab, or any
-specific project's model/data, exist. Built-in commands (pause, resume,
-set_lr, rewind, stop) are handled internally; anything project-specific
-(e.g. perturbing a layer) is added via register_handler() from the project
-side, with no changes needed here.
+TrainerController owns the training loop and dispatches commands found on
+its ControlHandle to registered handlers.
+
+It is written against TrackingHandle / ControlHandle only: no tracker, no
+project model or data. Built-in commands (pause, resume, stop, set_lr, and
+rewind when enabled) live here as module-level handlers; anything
+project-specific is added with `register_handler()`.
+
+Lifecycle, as seen in control/status.json's `state` field:
+
+    running -> paused -> running ... -> done | stopped
+                                     -> crashed      (exception, re-raised)
+                                     -> interrupted  (Ctrl-C, re-raised)
+
+`run.finalize()` is always called, whatever the exit path.
 """
 
+from __future__ import annotations
+
+import os
 import time
 from typing import Callable
 
+from .control import RunState, RunStatus, _NullControl
+from .events import append_event
+from .protocols import ControlHandle, TrackingHandle
+from .registry import ActionSpec, BUILTIN_ACTIONS, REWIND_ACTION, coerce_args, write_actions
 from .snapshot import SnapshotManager
-from .protocols import TrackingHandle, ControlHandle
-from .control import _NullControl, RunStatus
-
-from .registry import ActionSpec, BUILTIN_ACTIONS, write_actions
-from ._fsutil import atomic_write
-from ._layout import status_path
-
-
-
 
 EVAL_ARTIFACTS_GROUP = "eval_artifacts"
 
-def _handle_pause(self, cmd):
-    self.paused = True
-    self.status.update(paused=True)
 
-def _handle_resume(self, cmd):
-    self.paused = False
-    self.status.update(paused=False)
+# ---------------------------------------------------------------------------
+# built-in handlers: handler(controller, cmd) -> None
+# ---------------------------------------------------------------------------
 
-def _handle_stop(self, cmd):
-    self.status.update(running=False, done=True)
-    self._stop = True
+def _handle_pause(controller: "TrainerController", cmd: dict) -> None:
+    controller.paused = True
+    controller._set_state(RunState.PAUSED)
 
-def _handle_set_lr(controller, cmd):
-    """Set the learning rate of all param groups to cmd['lr']."""
+
+def _handle_resume(controller: "TrainerController", cmd: dict) -> None:
+    controller.paused = False
+    controller._set_state(RunState.RUNNING)
+
+
+def _handle_stop(controller: "TrainerController", cmd: dict) -> None:
+    controller._stop = True
+    controller.paused = False  # a paused run must fall through to the exit path
+
+
+def _handle_set_lr(controller: "TrainerController", cmd: dict) -> None:
     for g in controller.optimizer.param_groups:
         g["lr"] = cmd["lr"]
+    controller.status.update(lr=cmd["lr"])
 
 
-def _handle_rewind(controller, cmd):
-    """Rewind the model/optimizer state to the nearest snapshot at or before cmd['step'].
-    Create a new branch_id for the rewinded state, and log the fork in metrics.csv.
-    """
-    # Find the nearest snapshot at or before the requested step. This will be a TrainerState object.
-    # The nearest_before method will walk the lineage of branches to find the correct snapshot.
-    if controller.enable_rewind is False:
-        # raise exception
+def _handle_rewind(controller: "TrainerController", cmd: dict) -> None:
+    """Restore the nearest snapshot at or before cmd['step'] and continue on
+    a fresh branch. The fork is recorded in events.jsonl; metric rows carry
+    the new branch_id tag from here on."""
+    if controller.snapshots is None:
         raise RuntimeError("rewind is disabled; construct with enable_rewind=True")
     snap = controller.snapshots.nearest_before(cmd["step"], controller.branch_id)
     snap.restore(controller.model, controller.optimizer)
-    controller.step = snap.step
 
-    # Create a new branch_id for the rewinded state, and register it with the SnapshotManager.
-    parent_branch_id = snap.branch_id
+    parent_branch_id = controller.branch_id
+    from_step = controller.step
+    controller.step = snap.step
     controller._branch_counter += 1
     controller.branch_id = f"b{controller._branch_counter}@t{snap.step}"
-    controller.snapshots.register_branch(controller.branch_id, parent_branch_id, snap.step)
+    controller.snapshots.register_branch(controller.branch_id, snap.branch_id, snap.step)
 
-    # Log the fork in metrics.csv, so users can see the lineage of branches.
-    controller.run.track_metric(
-        controller.step, tags=controller._branch_tags(),
-        parent_branch_id=parent_branch_id, fork_step=snap.step,
-    )
+    controller.status.update(step=controller.step, branch_id=controller.branch_id,
+                             lr=controller._current_lr())
+    append_event(controller.run.run_dir, "fork", controller.step, controller.branch_id,
+                 parent_branch_id=parent_branch_id, snapshot_branch_id=snap.branch_id,
+                 fork_step=snap.step, from_step=from_step)
 
+
+# ---------------------------------------------------------------------------
 
 class TrainerController:
-    """
-    TrainerController: owns the training loop and dispatches commands found in
-    run.poll_commands() to registered handlers.
+    """Run a step-based training loop that can be steered from outside.
 
-    Args:
-        model: The model to train and evaluate.
-        optimizer: The optimizer to use for training.
-        total_steps: The total number of training steps to run.
-        train_step_fn: A callable that performs a single training step.
-        eval_fn: A callable that evaluates the model and returns a dict of metrics.       
-        run: A TrackingHandle for logging metrics and artifacts.
-        eval_art_fun: A callable that returns a dict of evaluation artifacts (optional).
-        control: A ControlHandle for receiving commands (optional).
-        enable_rewind: Whether to enable rewind functionality (optional).
-        logger_kwargs: Additional keyword arguments for the logger (optional).
-        log_metrics: A list of metric names to log during evaluation (optional).
-    
-    Provides methods to register custom command handlers, take snapshots, and run the training loop.
-    The TrainerController is designed to be agnostic of the specific model or data being used, 
-    and can be extended with project-specific command handlers.
+    Parameters
+    ----------
+    model, optimizer
+        The objects to train, snapshot and restore. `optimizer.param_groups`
+        is used by `set_lr` and for the `lr` field in status.
+    total_steps
+        Loop exit condition: `step` counts train_step_fn calls on the
+        current branch, so a rewind makes the run longer in wall-clock.
+    train_step_fn
+        `() -> dict | None`. One optimizer step. If it returns a dict of
+        floats and `train_log_every > 0`, they are logged as metrics every
+        `train_log_every` steps.
+    run
+        A TrackingHandle. Its `run_dir` hosts the control/ folder.
+    eval_fn
+        Optional `() -> dict`. Called at every step in `eval_schedule`; the
+        dict is logged as metrics.
+    eval_artifacts_fn
+        Optional `() -> dict`. Called at every step in
+        `eval_artifacts_schedule`. Keys are `name` or `(name, group)`,
+        values are `data` or `(data, type)`.
+    control
+        A ControlHandle (usually `RunMailbox(run.run_dir)`). None gives a
+        plain loop that never reads commands.
+    enable_rewind
+        Build a SnapshotManager and register the `rewind` command.
+    status_every
+        Write status.json every N steps (state transitions always write).
+    poll_every
+        Poll the mailbox every N steps (a paused loop polls continuously).
+    train_log_every
+        Log train_step_fn's returned dict every N steps. 0 disables.
+    logger_kwargs, log_metrics
+        Passed to `run.get_logger`; which eval metrics to echo to the log.
+
+    Determinism contract for exact rewinds: every source of randomness in
+    train_step_fn must derive from the torch / numpy / python RNGs, which
+    are captured and restored. Anything else with state (an LR scheduler, a
+    data iterator, a GradScaler) is not restored yet and will drift after a
+    rewind.
     """
-    def __init__(self, model, optimizer, total_steps, train_step_fn, eval_fn, 
-                 run: TrackingHandle,
-                 eval_art_fun = None,
+
+    def __init__(self, model, optimizer, total_steps: int, train_step_fn: Callable,
+                 run: TrackingHandle, *,
+                 eval_fn: Callable[[], dict] | None = None,
+                 eval_artifacts_fn: Callable[[], dict] | None = None,
                  control: ControlHandle | None = None,
-                 enable_rewind: bool  = False,     
+                 enable_rewind: bool = False,
+                 status_every: int = 10,
+                 poll_every: int = 1,
+                 train_log_every: int = 0,
                  logger_kwargs: dict | None = None,
                  log_metrics: list[str] | None = None):
-        
+        if status_every < 1 or poll_every < 1 or train_log_every < 0:
+            raise ValueError("status_every and poll_every must be >= 1, train_log_every >= 0")
+
         self.model = model
         self.optimizer = optimizer
+        self.total_steps = int(total_steps)
         self.train_step_fn = train_step_fn
         self.eval_fn = eval_fn
-        self.eval_art_fn = eval_art_fun
-        self.total_steps = total_steps
+        self.eval_artifacts_fn = eval_artifacts_fn
         self.run = run
         self.control = control or _NullControl()
+        self.enable_rewind = enable_rewind
+        self.status_every = status_every
+        self.poll_every = poll_every
+        self.train_log_every = train_log_every
         self.logger = run.get_logger(**(logger_kwargs or {}))
         self.log_metrics = log_metrics
 
-        self.enable_control = control is not None
-        self.enable_rewind = enable_rewind # even if control is given, user can disable rewind if they want
-        self.snapshots = SnapshotManager(run) if self.enable_rewind else None
+        self.snapshots = SnapshotManager(run) if enable_rewind else None
+        self.status = RunStatus(run.run_dir)
 
         self.step = 0
         self.paused = False
@@ -122,147 +167,188 @@ class TrainerController:
 
         self._branch_counter = 0
         self._stop = False
-        self._specs : list[ActionSpec] = list(BUILTIN_ACTIONS)
-        self._handlers: dict[str, callable] = {}
+        self._handlers: dict[str, Callable] = {}
+        self._custom_specs: list[ActionSpec] = []
+        self._spec_by_name: dict[str, ActionSpec] = {}
         self._register_builtin_handlers()
 
-        self.status = RunStatus(run.run_dir)
-       
+    # ---------------- extension points ----------------
 
-    # ---------------- extension point for project-specific commands ----------------
-    def register_handler(self, cmd_type : str, handler : Callable, spec: ActionSpec | None = None) -> None :
-        """handler(controller, cmd) -> None. Anything not built into rewind
-        gets registered here by the project -- rewind never needs to know
-        what it does, only that it exists."""
+    def register_handler(self, cmd_type: str, handler: Callable, spec: ActionSpec | None = None) -> None:
+        """Register `handler(controller, cmd)` for commands of type
+        `cmd_type`. Passing `spec` makes the command appear in the dashboard
+        and enables argument coercion. Registering an existing type
+        (including a built-in) replaces it."""
         self._handlers[cmd_type] = handler
-        if spec is not None: 
-            self._specs.append(spec)
-            
-    def _register_builtin_handlers(self):
-        handlers = {
-            "pause":  _handle_pause,
-            "resume": _handle_resume,
-            "stop":   _handle_stop,
-            "set_lr": _handle_set_lr,
-        }
-        if self.snapshots is not None:
-            handlers["rewind"] = _handle_rewind
-        self._handlers.update(handlers)
+        if spec is not None:
+            if spec.name != cmd_type:
+                raise ValueError(f"spec.name {spec.name!r} must equal cmd_type {cmd_type!r}")
+            self._custom_specs = [s for s in self._custom_specs if s.name != cmd_type]
+            self._custom_specs.append(spec)
 
-    # ---------------- on-demand snapshot, for handlers doing something risky ----------------
+    def every(self, n: int, start: int = 0, end: int | None = None) -> set[int]:
+        """Convenience for schedules: `controller.eval_schedule = controller.every(50)`."""
+        end = self.total_steps if end is None else end
+        return set(range(start, end + 1, n))
+
     def snapshot_now(self):
-        """Force a snapshot of the current model/optimizer state, even if it's not on the eval schedule."""
+        """Force a snapshot of the current state; handlers that mutate
+        weights should call this first so the change can be rewound."""
         if self.snapshots is None:
-            # Log and Raise an error
-            self.logger.error("snapshotting is disabled; construct with enable_rewind=True")
             raise RuntimeError("snapshotting is disabled; construct with enable_rewind=True")
         return self.snapshots.force_snapshot(
-            self.step, self.model, self.optimizer,
-            self.optimizer.param_groups[0]["lr"], self.branch_id,
+            self.step, self.model, self.optimizer, self._current_lr(), self.branch_id,
         )
-    
-    # ---------------- shared branch-scoping helpers ----------------
+
+    # ---------------- internals ----------------
+
+    def _register_builtin_handlers(self) -> None:
+        self._handlers.update({
+            "pause": _handle_pause,
+            "resume": _handle_resume,
+            "stop": _handle_stop,
+            "set_lr": _handle_set_lr,
+        })
+        if self.snapshots is not None:
+            self._handlers["rewind"] = _handle_rewind
+
+    def _build_specs(self) -> list[ActionSpec]:
+        """Specs for every handler that has one, built at run_loop time so
+        the list can never disagree with the handler table."""
+        builtins = list(BUILTIN_ACTIONS) + ([REWIND_ACTION] if self.snapshots is not None else [])
+        custom_names = {s.name for s in self._custom_specs}
+        specs = [s for s in builtins if s.name in self._handlers and s.name not in custom_names]
+        specs += [s for s in self._custom_specs if s.name in self._handlers]
+        return specs
+
+    def _current_lr(self) -> float | None:
+        groups = getattr(self.optimizer, "param_groups", None)
+        return groups[0].get("lr") if groups else None
+
+    def _set_state(self, state: RunState, **extra) -> None:
+        self.status.update(step=self.step, branch_id=self.branch_id, state=state,
+                           lr=self._current_lr(), **extra)
+        append_event(self.run.run_dir, "state", self.step, self.branch_id, state=state.value, **extra)
+
     def _branch_tags(self) -> dict:
-        """No tag at all if rewind is disabled — keeps metrics.csv free of a
-        constant 'root' column for users who never branch."""
+        """No tag at all if rewind is disabled, so non-branching users get a
+        metrics table without a constant 'root' column."""
         return {"branch_id": self.branch_id} if self.enable_rewind else {}
-    
+
     def _branch_scoped_name(self, base_name: str) -> str:
-        """If rewind is enabled, prefix the artifact name with the branch_id,
-        so that artifacts from different branches don't collide. If rewind is
-        disabled, return the base name unchanged."""
         return f"{base_name}__{self.branch_id}" if self.enable_rewind else base_name
 
-    def _apply(self, cmd: dict):
-        """Dispatch a command to its registered handler, or log a warning if no handler is registered."""
-        cmd_type = cmd.get("type")
+    def _poll_and_apply(self) -> None:
+        for cmd in self.control.poll_commands():
+            self._apply(cmd)
+
+    def _apply(self, cmd: dict) -> None:
+        cmd_type = cmd.get("type") if isinstance(cmd, dict) else None
         handler = self._handlers.get(cmd_type)
         if handler is None:
-            self.logger.warning(f"unknown command type: {cmd_type!r}, ignoring")
+            self.logger.warning(f"unknown command type {cmd_type!r}, ignoring")
+            append_event(self.run.run_dir, "failed", self.step, self.branch_id,
+                         command=cmd, error=f"unknown command type {cmd_type!r}")
             return
         try:
+            spec = self._spec_by_name.get(cmd_type)
+            if spec is not None:
+                cmd = coerce_args(spec, cmd)
             handler(self, cmd)
         except Exception as e:
             self.logger.exception(f"command {cmd_type!r} failed at step {self.step}, ignoring")
-            self.logger.exception(f"{e}")
-            self.run.track_metric(self.step, tags=self._branch_tags(),
-                                   note=f"command failed: {cmd_type}", event=cmd)
+            append_event(self.run.run_dir, "failed", self.step, self.branch_id,
+                         command=cmd, error=f"{type(e).__name__}: {e}")
             return
         self.logger.info(f"applied {cmd_type} at step {self.step} (branch={self.branch_id})")
-        self.run.track_metric(self.step, tags=self._branch_tags(),
-                               note=f"applied {cmd_type}", event=cmd)
+        append_event(self.run.run_dir, "applied", self.step, self.branch_id, command=cmd)
 
-    def _log_eval(self, metrics: dict):
-        keys = self.log_metrics if self.log_metrics is not None else metrics.keys()
-        parts = [f"{k}={metrics[k]:.4f}" for k in keys if k in metrics]
-
-        msg = f"step {self.step}/{self.total_steps} | " 
+    def _log_eval(self, metrics: dict) -> None:
+        keys = self.log_metrics if self.log_metrics is not None else list(metrics.keys())
+        parts = []
+        for k in keys:
+            if k in metrics:
+                v = metrics[k]
+                parts.append(f"{k}={v:.4f}" if isinstance(v, float) else f"{k}={v}")
+        msg = f"step {self.step}/{self.total_steps} | "
         msg += f"branch={self.branch_id} | " if self.enable_rewind else ""
-        msg += " | ".join(parts)
-        self.logger.info(msg)
+        self.logger.info(msg + " | ".join(parts))
 
-
-    def _log_eval_artifacts(self, artifacts: dict):
-        """
-        Save evaluation artifacts to the run, under the group specified and
-        with names prefixed by the current branch_id in case of rewinding. 
-        Log how many artifacts were saved.
-
-        Parameters:
-        artifacts (dict): A dictionary {key:value} where keys are either name strings or tuples of (name, group)
-        and values are either data or tuples of (data, type). The group defaults to None if not provided, 
-        and the type defaults to 'tensor' if not provided. 
-        """
+    def _log_eval_artifacts(self, artifacts: dict) -> None:
         for key, value in artifacts.items():
             data, atype = value if isinstance(value, tuple) else (value, "tensor")
             name, group = key if isinstance(key, tuple) else (key, None)
-            self.run.track_artifact(
-                data, step=self.step, group=group,
-                name=self._branch_scoped_name(name), type=atype,
-            )
+            self.run.track_artifact(data, step=self.step, group=group,
+                                    name=self._branch_scoped_name(name), type=atype)
         msg = f"saved {len(artifacts)} eval artifact(s) at step {self.step}"
         msg += f" (branch={self.branch_id})" if self.enable_rewind else ""
         self.logger.info(msg)
 
+    # ---------------- the loop ----------------
 
-    def run_loop(self):
-        self.logger.info(f"starting training | run_id={self.run.run_id} | "
-                          f"total_steps={self.total_steps}")
-        
-        write_actions(self.run.run_dir, self._specs)
-        self.status.update(step=0, branch_id=self.branch_id, running=True, paused=False, done=False)
+    def run_loop(self) -> None:
+        self.logger.info(f"starting training | run_id={self.run.run_id} | total_steps={self.total_steps}")
+        specs = self._build_specs()
+        self._spec_by_name = {s.name: s for s in specs}
+        write_actions(self.run.run_dir, specs)
+        self.status.update(total_steps=self.total_steps, pid=os.getpid())
+        self._set_state(RunState.RUNNING)
 
+        try:
+            self._loop()
+        except KeyboardInterrupt:
+            self.logger.warning(f"interrupted at step {self.step}")
+            self._set_state(RunState.INTERRUPTED)
+            raise
+        except Exception as e:
+            self.logger.exception(f"training crashed at step {self.step}")
+            self._set_state(RunState.CRASHED, error=f"{type(e).__name__}: {e}")
+            raise
+        else:
+            final = RunState.STOPPED if self._stop else RunState.DONE
+            self.logger.info(f"training {final.value} at step {self.step} (branch={self.branch_id})")
+            self._set_state(final)
+        finally:
+            self.run.finalize()
+
+    def _loop(self) -> None:
         while self.step < self.total_steps and not self._stop:
-            for cmd in self.control.poll_commands():
-                self._apply(cmd)
+            if self.paused or self.step % self.poll_every == 0:
+                self._poll_and_apply()
 
             if self.paused:
-                self.status.update(paused=True)
                 time.sleep(0.1)
                 continue
+            if self._stop:
+                break
 
-            if self.step in self.eval_schedule:
+            if self.eval_fn is not None and self.step in self.eval_schedule:
                 metrics = self.eval_fn()
                 self.run.track_metric(self.step, tags=self._branch_tags(), **metrics)
                 self._log_eval(metrics)
 
-            if self.eval_art_fn is not None and self.step in self.eval_artifacts_schedule:
-                self._log_eval_artifacts(self.eval_art_fn())
+            if self.eval_artifacts_fn is not None and self.step in self.eval_artifacts_schedule:
+                self._log_eval_artifacts(self.eval_artifacts_fn())
 
             if self.snapshots is not None:
                 self.snapshots.maybe_snapshot(
-                    self.step, self.model, self.optimizer,
-                    self.optimizer.param_groups[0]["lr"], self.branch_id,
+                    self.step, self.model, self.optimizer, self._current_lr(), self.branch_id,
                 )
 
-            self.train_step_fn()
-            self.step += 1
-            self.status.update(step=self.step) 
-            # To be changed potentially
-            # if self.step % self.status_every == 0: self.status.update(step=self.step)  
-            # # e.g. status_every = 10, a new __init__ param
-                
+            out = self.train_step_fn()
+            if (self.train_log_every and isinstance(out, dict) and out
+                    and self.step % self.train_log_every == 0):
+                self.run.track_metric(self.step, tags=self._branch_tags(), **out)
 
-        self.logger.info(f"training finished at step {self.step} (branch={self.branch_id})")
-        self.status.update(running=False, paused=False, done=True)
-        self.run.finalize()
+            self.step += 1
+            if self.step % self.status_every == 0:
+                self.status.update(step=self.step, lr=self._current_lr())
+
+        # A completed run evaluates its final weights if the schedule asks
+        # for it; the loop body only evaluates *before* each train step.
+        if not self._stop and self.eval_fn is not None and self.step in self.eval_schedule:
+            metrics = self.eval_fn()
+            self.run.track_metric(self.step, tags=self._branch_tags(), **metrics)
+            self._log_eval(metrics)
+        if not self._stop and self.eval_artifacts_fn is not None and self.step in self.eval_artifacts_schedule:
+            self._log_eval_artifacts(self.eval_artifacts_fn())
