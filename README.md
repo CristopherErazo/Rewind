@@ -26,14 +26,14 @@ Track metrics or configs durably: that is your experiment tracker's job. The cor
 git clone https://github.com/CristopherErazo/Rewind
 cd Rewind
 uv sync --extra dashboard     # creates .venv with everything, including pytest
-uv run pytest -q              # 51 tests, about 5 seconds
+uv run pytest -q              # 60 tests, about 5 seconds
 ```
 
 Without `--extra dashboard` you get the core only; the dashboard end-to-end test skips itself.
 
 ## Try the example
 
-Two files in `examples/` show the whole workflow. Run them from the repo root in two terminals.
+`examples/toy_train.py` and `examples/dashboard_attach.py` show the whole workflow. Run them from the repo root in two terminals.
 
 Terminal 1, start a controllable training run:
 
@@ -51,12 +51,22 @@ uv run shiny run --reload examples/dashboard_attach.py
 
 Open the printed URL (usually `http://127.0.0.1:8000`). In the sidebar pick experiment `toy` and the run (the "Follow newest run" switch is on by default). Then:
 
-- **Live** tab: `train_loss` and `eval_loss` update as the run goes.
-- **Control** tab: click **Pause**, watch the status bar turn to `paused`, click **Resume**. Set a new learning rate and **Send**. Send **Perturb weights** with a noise scale and watch the loss jump. Type an earlier step into **Rewind to step** and **Send**: the status bar shows a new branch such as `b1@t2400`, the Live plot grows a second colored line, and the loss curve replays. Snapshots are dense (every 10 steps) only over the last 200 steps and sparse (every 200 steps) before that, so a rewind to step 150 sent at step 400 lands on `b1@t0`, the nearest snapshot at or before the request.
+- **Live** tab: `train_loss` and `eval_loss` update as the run goes. The toolbar above the plot holds every command the run accepts: **Pause**, **Resume** and **Stop** are player-style buttons (hover one for what it does); commands with arguments, such as **Set learning rate**, are inline fields: type a value and press Enter, or click the return arrow. Hover a field's label for its description and argument details. Clicking a point on the plot fills in the **Rewind to step** field with that step.
+- In that toolbar, click **Pause**, watch the status bar turn to `paused`, click **Resume**. Set a new learning rate and **Send**. Send **Perturb weights** with a noise scale and watch the loss jump. Type an earlier step into **Rewind to step** and **Send**: the status bar shows a new branch such as `b1@t2400`, the Live plot grows a second colored line, and the loss curve replays. Snapshots are dense (every 10 steps) only over the last 200 steps and sparse (every 200 steps) before that, so a rewind to step 150 sent at step 400 lands on `b1@t0`, the nearest snapshot at or before the request.
 - **Events** tab: every command, its arguments, each branch fork and each state change, newest first.
 - **Runs** tab: one row per run with the config fields that differ between them.
 
 Stop the run with **Stop**, or Ctrl-C the terminal; either way the status bar shows the final state. The dashboard has no launch form in this example because no entrypoint is configured; see "Launching from the dashboard" below.
+
+### A second example: layer-wise interventions
+
+`examples/teacher_student.py` trains a 3-layer student MLP to imitate a frozen 3-layer teacher on Gaussian inputs, and every student layer starts **frozen**, so nothing is learned until you say so. Same dashboard, pick the `teacher_student` experiment:
+
+```bash
+uv run examples/teacher_student.py --steps 5000
+```
+
+It adds three commands with arguments: **Unfreeze layer** and **Freeze layer** (layer 1, 2 or 3) and **Perturb layer** (layer plus noise scale). The `w_norm_1..3` metrics show each layer's weight norm, so you can see which layers move, which are frozen and which one a perturbation hit. Weights are N(0, 1) and every preactivation is `gain * (W x / sqrt(fan_in) + b)`, so activations are order 1 for any width; `--gain` (default 1) sets how nonlinear the network is and `--act` picks ReLU (default) or tanh. Try unfreezing layer 3 alone, then 2, then 1: each step lowers the plateau, because a layer can only re-mix the features the frozen layers before it provide. Sending an invalid layer produces a `failed` event in the Events tab and training continues. The trainable mask is kept in a model buffer, so it is part of every snapshot: rewind to before an unfreeze and the layer is frozen again on the new branch.
 
 ## Quick start in your own script
 
