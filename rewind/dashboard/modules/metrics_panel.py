@@ -17,6 +17,11 @@ Design notes
   changes, so the renderer does not re-run for ordinary new points.
 * Each trace is stride-downsampled to MAX_POINTS_PER_TRACE so long runs stay
   cheap to serialize and draw.
+* Clicking a point on any trace publishes its step through the returned
+  `clicked_step` reactive value; app.py feeds it to the control panel, which
+  writes it into the rewind step input. Plotly click callbacks arrive
+  through the widget comm, which shinywidgets handles inside a reactive
+  effect, so setting the value there triggers dependents normally.
 """
 
 from __future__ import annotations
@@ -111,7 +116,14 @@ def build_figure(parsed: tuple[list[str], list[Trace]] | None) -> go.Figure:
             shown.add(t.branch)
         fig.add_trace(scatter, row=row, col=1)
     fig.update_xaxes(title_text="step", row=len(metrics), col=1)
-    fig.update_layout(margin=dict(t=30, b=10), height=max(MIN_HEIGHT_PX, ROW_HEIGHT_PX * len(metrics)),
+    # Fixed margins and no automargin: otherwise Plotly re-fits the margins
+    # to the current tick labels on every update, and the plot area slides
+    # a few pixels whenever a label gets longer or shorter. A compact tick
+    # format keeps labels inside the fixed margin.
+    fig.update_yaxes(automargin=False, tickformat=".3~g")
+    fig.update_xaxes(automargin=False)
+    fig.update_layout(margin=dict(l=64, r=16, t=30, b=40),
+                      height=max(MIN_HEIGHT_PX, ROW_HEIGHT_PX * len(metrics)),
                       legend_title_text="branch" if branches else None, uirevision="keep")
     return fig
 
@@ -124,6 +136,17 @@ def push_points(widget: go.FigureWidget, traces: list[Trace]) -> None:
             target.y = t.y
 
 
+def clicked_step_of(points) -> int | None:
+    """Step under a plotly click: the x of the first clicked point, or None."""
+    xs = getattr(points, "xs", None) or []
+    if not xs:
+        return None
+    try:
+        return int(round(float(xs[0])))
+    except (TypeError, ValueError):
+        return None
+
+
 @module.ui
 def metrics_panel_ui():
     return output_widget("chart")
@@ -131,6 +154,8 @@ def metrics_panel_ui():
 
 @module.server
 def metrics_panel_server(input, output, session, metrics: Callable[[], list[dict]]):
+    """Returns `clicked_step`, a reactive value holding the step of the last
+    point clicked on the plot (None until the first click)."""
 
     @reactive.calc
     def parsed():
@@ -138,6 +163,13 @@ def metrics_panel_server(input, output, session, metrics: Callable[[], list[dict
 
     structure: reactive.Value[tuple | None] = reactive.value(None)
     rendered_key: list = [None]  # structure the current widget was built for
+    clicked_step: reactive.Value[int | None] = reactive.value(None)
+    wired: set[int] = set()  # id() of widgets whose traces already have click handlers
+
+    def _on_click(trace, points, state):
+        step = clicked_step_of(points)
+        if step is not None:
+            clicked_step.set(step)
 
     @reactive.effect
     def _track_structure():
@@ -160,8 +192,14 @@ def metrics_panel_server(input, output, session, metrics: Callable[[], list[dict
         widget = chart.widget  # re-runs after every re-render as well
         if widget is None or current is None:
             return
+        if id(widget) not in wired:
+            wired.add(id(widget))
+            for trace in widget.data:
+                trace.on_click(_on_click)
         if rendered_key[0] != structure_key(current):
             return  # a rebuild is pending; it will carry these points
         _, traces = current
         if len(widget.data) == len(traces):
             push_points(widget, traces)
+
+    return clicked_step

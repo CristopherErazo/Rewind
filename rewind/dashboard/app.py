@@ -127,13 +127,21 @@ def build_dashboard(cfg: DashboardConfig) -> App:
         sidebar_items.append(launcher_form.launcher_form_ui("launch", cfg))
 
     app_ui = ui.page_fluid(
+        # Outputs here refresh every second by design. Per-output spinners
+        # would flash constantly and their min-height nudges the layout; the
+        # fade dims a recalculating output's children to 30% instantly and
+        # snaps back when the value lands, a visible flicker on the status
+        # bar. The top-of-page pulse remains as the busy cue.
+        ui.busy_indicators.use(spinners=False, fade=False),
         ui.h2(cfg.title),
         ui.layout_sidebar(
-            ui.sidebar(*sidebar_items, width=380),
+            ui.sidebar(*sidebar_items, width=340, open="desktop"),
             status_bar.status_bar_ui("status"),
             ui.navset_tab(
-                ui.nav_panel("Live", metrics_panel.metrics_panel_ui("metrics")),
-                ui.nav_panel("Control", control_panel.control_panel_ui("control")),
+                # Controls are one thin toolbar row above the plot, so an
+                # intervention never hides the metrics.
+                ui.nav_panel("Live", control_panel.control_panel_ui("control"),
+                             metrics_panel.metrics_panel_ui("metrics")),
                 ui.nav_panel("Events", events_panel.events_panel_ui("events")),
                 ui.nav_panel("Runs", runs_table.runs_table_ui("runs")),
                 *[ui.nav_panel(ext.label, ext.ui()) for ext in cfg.extensions],
@@ -193,8 +201,9 @@ def build_dashboard(cfg: DashboardConfig) -> App:
 
         # ---- panels ------------------------------------------------------
         status_bar.status_bar_server("status", active_run_dir, status, active_launcher)
-        metrics_panel.metrics_panel_server("metrics", metrics)
-        control_panel.control_panel_server("control", active_run_dir, status, active_mailbox, active_launcher)
+        clicked_step = metrics_panel.metrics_panel_server("metrics", metrics)
+        control_panel.control_panel_server("control", active_run_dir, status, active_mailbox, active_launcher,
+                                           step_hint=clicked_step)
         events_panel.events_panel_server("events", events)
         runs_table.runs_table_server("runs", reader, runs)
 

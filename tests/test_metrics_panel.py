@@ -74,6 +74,9 @@ def test_build_figure_matches_trace_order_and_legend():
     assert [d.name for d in fig.data] == ["root", "root", "b1@t100", "b1@t100"]
     assert [d.showlegend for d in fig.data] == [True, False, True, False]  # one legend entry per branch
     assert fig.layout.height == 200 * len(metrics)
+    # no automargin: the plot area must not slide when tick labels change width
+    assert fig.layout.yaxis.automargin is False and fig.layout.yaxis2.automargin is False
+    assert fig.layout.margin.l == 64
     # traces for the second metric land on the second subplot
     assert fig.data[0].yaxis == "y" and fig.data[1].yaxis == "y2"
 
@@ -91,3 +94,12 @@ def test_push_points_updates_in_place():
     assert len(fig.data) == len(traces)
     assert np.array_equal(np.asarray(fig.data[0].x), traces[0].x)
     assert np.array_equal(np.asarray(fig.data[1].y), traces[1].y)
+
+
+def test_clicked_step_of_reads_first_point():
+    from types import SimpleNamespace
+    from rewind.dashboard.modules.metrics_panel import clicked_step_of
+    assert clicked_step_of(SimpleNamespace(xs=[1000.0], ys=[0.5])) == 1000
+    assert clicked_step_of(SimpleNamespace(xs=[999.6])) == 1000
+    assert clicked_step_of(SimpleNamespace(xs=[])) is None
+    assert clicked_step_of(SimpleNamespace()) is None
