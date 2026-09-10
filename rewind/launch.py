@@ -1,13 +1,17 @@
-"""rewind/dashboard/launch.py
+"""rewind/launch.py
 
 RunLauncher owns the lifecycle of exactly one subprocess-backed training run:
 spawning it, learning its run_id via a handshake (never predicting it),
-tracking its PID on disk, and exposing liveness/kill controls.
+persisting its PID, and exposing liveness / kill controls that work on both
+POSIX and Windows.
 
-Deliberately has no Shiny dependency, so it can be unit-tested and used
-standalone (a notebook, a script, a future non-Shiny UI) without spinning up
-an app. The Shiny control_panel/experiment_picker modules are thin wrappers
-around this class.
+No Shiny dependency, so it can be used from a script or tested directly.
+
+Windows note: `os.kill(pid, 0)` is NOT a liveness probe on Windows. Any
+signal other than the CTRL events makes CPython call TerminateProcess with
+that value as the exit code, so the old `_pid_alive` would have killed the
+training run. Liveness now goes through psutil when available, then a
+ctypes OpenProcess check on Windows, and `os.kill(pid, 0)` only on POSIX.
 """
 
 from __future__ import annotations
@@ -22,13 +26,20 @@ import uuid
 from dataclasses import dataclass, asdict
 from pathlib import Path
 
-from ._fsutil import atomic_write  # rewind's own helper -- not a tracklab import
+from ._fsutil import atomic_write
 from ._layout import handshake_path as _handshake_path
 from ._layout import pending_dir, process_path
 
-HANDSHAKE_TIMEOUT_S = 30.0   # max time to wait for the subprocess to claim a run_id
+HANDSHAKE_TIMEOUT_S = 30.0
 HANDSHAKE_POLL_S = 0.05
-TERMINATE_GRACE_S = 5.0      # SIGTERM -> SIGKILL escalation window
+TERMINATE_GRACE_S = 5.0
+
+_IS_WINDOWS = sys.platform.startswith("win")
+
+try:  # optional, gives the most reliable liveness/kill on every platform
+    import psutil  # type: ignore
+except ImportError:  # pragma: no cover
+    psutil = None
 
 
 class LaunchError(RuntimeError):
@@ -37,10 +48,8 @@ class LaunchError(RuntimeError):
 
 @dataclass
 class ProcessRecord:
-    """Persisted to `<run_dir>/control/process.json` (see rewind._layout).
-    Small and boring on purpose —
-    this is what lets a *new* dashboard session reattach to a run that's
-    still going after the dashboard itself was restarted."""
+    """Persisted to `control/process.json` so a later dashboard session can
+    reattach to a run it did not start."""
 
     pid: int
     run_id: str
@@ -60,21 +69,20 @@ class RunLauncher:
     """
     Usage
     -----
-        launcher = RunLauncher(exp_dir, entrypoint="my_project.launcher")
+        launcher = RunLauncher("my-exp", Path("./data"), entrypoint="my_project.launcher")
         record = launcher.launch({"model_args.vocab_size": "128"})
-        ...
         launcher.is_alive()
         launcher.terminate()
 
-    One instance == one owned process. Don't reuse an instance across runs;
-    construct a new one (or use `RunLauncher.attach` for reattaching to a
-    run started by a previous dashboard session).
+    One instance == one owned process. Use `RunLauncher.attach(run_dir)` to
+    get a handle on a run started by someone else (an earlier dashboard
+    session, or a terminal); that handle can probe and kill but not relaunch.
     """
 
     def __init__(self, exp_name: str, base_dir: Path, entrypoint: str, python: str | None = None):
-        self.exp_dir = base_dir / exp_name
+        self.base_dir = Path(base_dir)
         self.exp_name = exp_name
-        self.base_dir = base_dir
+        self.exp_dir = self.base_dir / exp_name
         self.entrypoint = entrypoint
         self.python = python or sys.executable
         self._proc: subprocess.Popen | None = None
@@ -84,32 +92,30 @@ class RunLauncher:
     # Launching
     # ------------------------------------------------------------------ #
 
-    def launch(self, overrides: dict[str, str]) -> ProcessRecord:
-        """Spawn the training subprocess and block briefly until it tells us
-        (not: until we guess) which run_id it claimed."""
+    def launch(self, overrides: dict[str, object]) -> ProcessRecord:
+        """Spawn `python -m <entrypoint> key=value ...` and block until the
+        child writes its handshake file with the run_id it claimed."""
         if self._proc is not None and self.is_alive():
-            raise LaunchError(
-                "This RunLauncher already owns a live process; construct a new "
-                "instance per launch rather than reusing one."
-            )
+            raise LaunchError("This RunLauncher already owns a live process; "
+                              "construct a new instance per launch.")
+        if not self.entrypoint:
+            raise LaunchError("RunLauncher has no entrypoint; attached handles cannot launch.")
 
         token = uuid.uuid4().hex
         pending_dir(self.exp_dir).mkdir(parents=True, exist_ok=True)
         handshake_path = _handshake_path(self.exp_dir, token)
 
         cli_overrides = [f"{k}={v}" for k, v in overrides.items()]
-        
-        for k , v in {'launch_token':token,
-                      'experiment_name':self.exp_name,
-                      'base_dir':self.base_dir}.items():
-            cli_overrides.append(f"extra_args.{k}={v}")
-
+        injected = {"launch_token": token, "experiment_name": self.exp_name, "base_dir": str(self.base_dir)}
+        cli_overrides += [f"extra_args.{k}={v}" for k, v in injected.items()]
         cmd = [self.python, "-m", self.entrypoint, *cli_overrides]
 
-        # start_new_session=True puts the child in its own process group, so
-        # terminate() can be extended later to signal the whole group if a
-        # project's train loop ever spawns its own workers.
-        proc = subprocess.Popen(cmd, start_new_session=True)
+        popen_kwargs: dict = {}
+        if _IS_WINDOWS:
+            popen_kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
+        else:
+            popen_kwargs["start_new_session"] = True
+        proc = subprocess.Popen(cmd, **popen_kwargs)
 
         try:
             run_id = self._await_handshake(handshake_path, proc)
@@ -117,15 +123,9 @@ class RunLauncher:
             handshake_path.unlink(missing_ok=True)
             raise
 
-        record = ProcessRecord(
-            pid=proc.pid,
-            run_id=run_id,
-            cmd=cmd,
-            started_at=time.time(),
-            launch_token=token,
-        )
-        run_dir = self.exp_dir / run_id
-        atomic_write(process_path(run_dir), json.dumps(record.to_json(), indent=2))
+        record = ProcessRecord(pid=proc.pid, run_id=run_id, cmd=cmd,
+                               started_at=time.time(), launch_token=token)
+        atomic_write(process_path(self.exp_dir / run_id), json.dumps(record.to_json(), indent=2))
         handshake_path.unlink(missing_ok=True)
 
         self._proc = proc
@@ -136,40 +136,36 @@ class RunLauncher:
         deadline = time.monotonic() + HANDSHAKE_TIMEOUT_S
         while time.monotonic() < deadline:
             if handshake_path.exists():
-                data = json.loads(handshake_path.read_text())
-                return data["run_id"]
+                try:
+                    return json.loads(handshake_path.read_text(encoding="utf-8"))["run_id"]
+                except (json.JSONDecodeError, KeyError, OSError):
+                    pass  # half-written; try again next tick
             exit_code = proc.poll()
             if exit_code is not None:
-                raise LaunchError(
-                    f"Subprocess exited with code {exit_code} before claiming a "
-                    f"run_id. cmd={proc.args}"
-                )
+                raise LaunchError(f"Subprocess exited with code {exit_code} before claiming a "
+                                  f"run_id. cmd={proc.args}")
             time.sleep(HANDSHAKE_POLL_S)
-
         proc.kill()
-        raise LaunchError(
-            "Timed out waiting for the subprocess to claim a run_id "
-            f"(waited {HANDSHAKE_TIMEOUT_S}s). It may be hanging during import/setup."
-        )
+        raise LaunchError(f"Timed out waiting for the subprocess to claim a run_id "
+                          f"(waited {HANDSHAKE_TIMEOUT_S}s). It may be hanging during import/setup.")
 
     # ------------------------------------------------------------------ #
-    # Reattaching (dashboard restarted, subprocess is still running)
+    # Reattaching
     # ------------------------------------------------------------------ #
 
     @classmethod
     def attach(cls, run_dir: Path) -> RunLauncher | None:
-        """Rebuild a lifecycle handle from a persisted process.json. Returns
-        None if there's no record (nothing was ever launched for this run,
-        e.g. it was created directly via the CLI)."""
+        """Rebuild a lifecycle handle from a persisted process.json. None if
+        nothing was ever launched for this run (e.g. started from a CLI
+        without a launcher)."""
+        run_dir = Path(run_dir)
         record_path = process_path(run_dir)
-        if not record_path.exists():
+        try:
+            record = ProcessRecord.from_json(json.loads(record_path.read_text(encoding="utf-8")))
+        except (FileNotFoundError, json.JSONDecodeError, TypeError, OSError):
             return None
-        record = ProcessRecord.from_json(json.loads(record_path.read_text()))
-        launcher = cls.__new__(cls)  # skip __init__: we don't need entrypoint/exp_dir to attach
-        launcher.exp_dir = run_dir.parent
-        launcher.entrypoint = None
-        launcher.python = None
-        launcher._proc = None
+        launcher = cls(exp_name=run_dir.parent.name, base_dir=run_dir.parent.parent,
+                       entrypoint="", python=None)
         launcher._record = record
         return launcher
 
@@ -182,55 +178,106 @@ class RunLauncher:
         return self._record
 
     def is_alive(self) -> bool:
+        if self._proc is not None:
+            return self._proc.poll() is None
         if self._record is None:
             return False
-        return _pid_alive(self._record.pid)
+        return pid_alive(self._record.pid)
 
     def terminate(self, force: bool = False) -> None:
-        """SIGTERM, wait up to TERMINATE_GRACE_S, escalate to SIGKILL. Pass
-        force=True to skip straight to SIGKILL (e.g. a user hitting "kill"
-        a second time after a graceful terminate didn't take)."""
-        if self._record is None or not self.is_alive():
+        """Ask the process to exit, wait up to TERMINATE_GRACE_S, then kill.
+        `force=True` kills immediately."""
+        if not self.is_alive():
+            return
+        pid = self._record.pid if self._record else (self._proc.pid if self._proc else None)
+        if pid is None:
             return
 
-        pid = self._record.pid
-        sig = signal.SIGKILL if force else signal.SIGTERM
-        try:
-            os.kill(pid, sig)
-        except ProcessLookupError:
+        if self._proc is not None:
+            (self._proc.kill if force else self._proc.terminate)()
+            try:
+                self._proc.wait(timeout=TERMINATE_GRACE_S)
+            except subprocess.TimeoutExpired:
+                self._proc.kill()
+                self._proc.wait(timeout=TERMINATE_GRACE_S)
             return
 
+        _signal_pid(pid, force=force)
         if force:
             return
-
         deadline = time.monotonic() + TERMINATE_GRACE_S
         while time.monotonic() < deadline:
-            if not _pid_alive(pid):
+            if not pid_alive(pid):
                 return
             time.sleep(0.1)
-
-        try:
-            os.kill(pid, signal.SIGKILL)
-        except ProcessLookupError:
-            pass
+        _signal_pid(pid, force=True)
 
 
 def write_handshake(exp_dir: Path, token: str, run_id: str) -> None:
-    """Called from the training-process side (see icl.launcher.build_controller)
-    once a run_id has been claimed, to tell the RunLauncher waiting in the
-    parent process which run_id was actually chosen. This is the write half
-    of the handshake RunLauncher._await_handshake() polls for -- kept here,
-    next to that method, so the `.pending/<token>.json` path convention is
-    defined in exactly one place (_layout.py) rather than reconstructed by
-    hand on both the launching and the launched side."""
-    atomic_write(_handshake_path(exp_dir, token), json.dumps({"run_id": run_id}))
+    """Training-process side of the launch handshake: call this right after
+    the tracker has claimed a run_id."""
+    atomic_write(_handshake_path(Path(exp_dir), token), json.dumps({"run_id": run_id}))
 
 
-def _pid_alive(pid: int) -> bool:
+# ---------------------------------------------------------------------------
+# process helpers (module-level so the dashboard can use them on attached runs)
+# ---------------------------------------------------------------------------
+
+def pid_alive(pid: int) -> bool:
+    """Liveness probe that is safe on Windows (never sends a signal there)."""
+    if pid is None or pid <= 0:
+        return False
+    if psutil is not None:
+        try:
+            p = psutil.Process(pid)
+            return p.is_running() and p.status() != psutil.STATUS_ZOMBIE
+        except psutil.Error:
+            return False
+    if _IS_WINDOWS:
+        return _windows_pid_alive(pid)
     try:
         os.kill(pid, 0)
     except ProcessLookupError:
         return False
     except PermissionError:
-        return True  # process exists, just isn't ours
+        return True
     return True
+
+
+def _windows_pid_alive(pid: int) -> bool:  # pragma: no cover (Windows only)
+    import ctypes
+    from ctypes import wintypes
+    PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+    STILL_ACTIVE = 259
+    kernel32 = ctypes.windll.kernel32
+    handle = kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+    if not handle:
+        return False
+    try:
+        code = wintypes.DWORD()
+        if not kernel32.GetExitCodeProcess(handle, ctypes.byref(code)):
+            return False
+        return code.value == STILL_ACTIVE
+    finally:
+        kernel32.CloseHandle(handle)
+
+
+def _signal_pid(pid: int, force: bool) -> None:
+    """Terminate a process we do not own a Popen for."""
+    if psutil is not None:
+        try:
+            p = psutil.Process(pid)
+            (p.kill if force else p.terminate)()
+        except psutil.Error:
+            pass
+        return
+    if _IS_WINDOWS:
+        # There is no graceful signal for a console process we don't own;
+        # taskkill /F is the honest option, /T takes the process tree along.
+        subprocess.run(["taskkill", "/PID", str(pid), "/T", "/F"],
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        return
+    try:
+        os.kill(pid, signal.SIGKILL if force else signal.SIGTERM)
+    except ProcessLookupError:
+        pass
