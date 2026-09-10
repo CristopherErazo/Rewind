@@ -61,6 +61,6 @@ Attach-first: `build_dashboard(DashboardConfig(base_dir=...))` is a complete das
 
 ## Current state to be aware of
 
-- `README.md` predates the protocol split and describes modules that no longer exist. The authoritative public surface is `rewind/__init__.py` and `rewind/dashboard/__init__.py`; rewriting the README is Milestone 3.
+- `README.md` reflects the current API (install with uv, the toy example walkthrough, the determinism contract and known limitations). Keep it in sync when the public surface in `rewind/__init__.py` or `rewind/dashboard/__init__.py` changes.
 - `../ICL` currently has no live Python files importing `rewind` (only stale `.pyc`), so API changes here break nothing downstream yet. ICL's entrypoint will need the `rewind.cli` override parser planned for Milestone 3.
 - `examples/data/` is created by the toy script and is ignored by the `data/` rule.
