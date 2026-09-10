@@ -1,20 +1,13 @@
-"""rewind/dashboard/registry.py
+"""rewind/registry.py
 
 The self-describing control surface. A running TrainerController declares
-what commands it accepts -- built-ins (pause/resume/stop/set_lr) plus
-anything a project registers with `register_handler(..., spec=...)` -- as a
-list of ActionSpec. That list is written once to `<run_dir>/actions.json` at
-run start. The dashboard's control_panel module reads that file and renders
-generic controls for whatever it finds. It never imports project code: this
-is what makes a project-specific command (e.g. "perturb_layer") show up in
-the UI the moment it's registered, with zero dashboard changes.
+what commands it accepts -- built-ins plus anything a project registers with
+`register_handler(..., spec=...)` -- as a list of ActionSpec, written once to
+`control/actions.json` at run start. The dashboard's control_panel renders
+generic controls for whatever it finds there and never imports project code.
 
-Integration touch points (outside this file):
-  - rewind.controller.TrainerController.register_handler gains an optional
-    `spec: ActionSpec` kwarg; the controller keeps its own running list
-    starting from BUILTIN_ACTIONS and appends each spec it's given.
-  - TrainerController.run_loop() calls write_actions(run.run_dir, self._specs)
-    once, before entering the poll loop.
+The same specs are used on the trainer side to coerce incoming command
+arguments (`coerce_args`), so the trainer never trusts the UI's types.
 """
 
 from __future__ import annotations
@@ -31,12 +24,12 @@ from ._layout import actions_path
 ArgKind = Literal["int", "float", "str", "bool"]
 
 _SLUG_RE = re.compile(r"[^a-zA-Z0-9_]+")
+_TRUE = {"1", "true", "yes", "on", "t", "y"}
+_FALSE = {"0", "false", "no", "off", "f", "n", ""}
 
 
 def _slugify(text: str) -> str:
-    """Turn an arbitrary display string into a safe HTML/Shiny id fragment:
-    non-alphanumerics collapsed to underscores, lowercased, and guaranteed
-    not to start with a digit (invalid for an HTML id)."""
+    """Arbitrary display string -> safe HTML/Shiny id fragment."""
     slug = _SLUG_RE.sub("_", text.strip()).strip("_").lower()
     if not slug:
         slug = "action"
@@ -50,38 +43,59 @@ class ArgSpec:
     kind: ArgKind
     default: Any = None
     description: str = ""
+    required: bool = True
+
+    def coerce(self, value: Any) -> Any:
+        """Convert a raw value (from JSON, a form, or a CLI) to `kind`.
+        Raises ValueError with a readable message on failure."""
+        try:
+            if self.kind == "bool":
+                if isinstance(value, bool):
+                    return value
+                if isinstance(value, (int, float)):
+                    return bool(value)
+                s = str(value).strip().lower()
+                if s in _TRUE:
+                    return True
+                if s in _FALSE:
+                    return False
+                raise ValueError(value)
+            if self.kind == "int":
+                if isinstance(value, bool):
+                    return int(value)
+                if isinstance(value, float):
+                    if not value.is_integer():
+                        raise ValueError(value)
+                    return int(value)
+                return int(str(value).strip())
+            if self.kind == "float":
+                return float(value)
+            if self.kind == "str":
+                return str(value)
+        except (TypeError, ValueError):
+            pass
+        raise ValueError(f"expected {self.kind}, got {value!r}")
 
 
 @dataclass
 class ActionSpec:
-    name: str  # command "type", e.g. "set_lr", "perturb layer" -- matches the
-    # `cmd_type` a handler is registered under in TrainerController. Free-form
-    # on purpose: it only needs to be a valid dict key, not a valid HTML id.
+    name: str  # command "type"; must match the handler's registered cmd_type
     label: str  # button / section text shown in the UI
     args: dict[str, ArgSpec] = field(default_factory=dict)
     description: str = ""
 
     @property
     def kind(self) -> Literal["button", "form"]:
-        """Derived, not stored. "button" if there are no args, "form"
-        otherwise -- kept as a property so it can never disagree with
-        `args`, which was possible when this was its own field."""
         return "button" if not self.args else "form"
 
     @property
     def html_id(self) -> str:
-        """Safe Shiny input id derived from `name`, e.g. "perturb layer" ->
-        "act_perturb_layer". control_panel.py should always go through this
-        (and arg_html_id below) rather than building ids by hand."""
         return f"act_{_slugify(self.name)}"
 
     def arg_html_id(self, arg_name: str) -> str:
         return f"{self.html_id}_arg_{_slugify(arg_name)}"
 
     def to_json(self) -> dict:
-        # `kind` and the *_html_id properties are derived, not persisted --
-        # from_json reconstructs an ActionSpec that recomputes them the
-        # same way, so there's nothing to keep in sync on disk.
         return {"name": self.name, "label": self.label,
                 "args": {k: asdict(v) for k, v in self.args.items()},
                 "description": self.description}
@@ -89,27 +103,50 @@ class ActionSpec:
     @classmethod
     def from_json(cls, d: dict) -> ActionSpec:
         args = {k: ArgSpec(**v) for k, v in d.get("args", {}).items()}
-        return cls(
-            name=d["name"],
-            label=d["label"],
-            args=args,
-            description=d.get("description", ""),
-        )
+        return cls(name=d["name"], label=d["label"], args=args,
+                   description=d.get("description", ""))
 
 
-# Specs for the handlers TrainerController always registers itself, so a
-# bare project (nothing custom registered) still gets a working panel.
+def coerce_args(spec: ActionSpec, cmd: dict) -> dict:
+    """Return a copy of `cmd` with every declared argument coerced to its
+    kind, defaults filled in, and undeclared keys (other than "type")
+    dropped. Raises ValueError listing every problem at once."""
+    out = {"type": cmd.get("type", spec.name)}
+    problems = []
+    for arg_name, arg in spec.args.items():
+        if arg_name in cmd and cmd[arg_name] is not None:
+            try:
+                out[arg_name] = arg.coerce(cmd[arg_name])
+            except ValueError as e:
+                problems.append(f"{arg_name}: {e}")
+        elif arg.default is not None:
+            out[arg_name] = arg.coerce(arg.default)
+        elif arg.required:
+            problems.append(f"{arg_name}: missing")
+    if problems:
+        raise ValueError(f"bad arguments for {spec.name!r}: " + "; ".join(problems))
+    return out
+
+
+# Specs for the handlers TrainerController always registers itself.
 BUILTIN_ACTIONS: list[ActionSpec] = [
     ActionSpec("pause", "Pause", description="Pause after the current step."),
     ActionSpec("resume", "Resume", description="Resume a paused run."),
     ActionSpec("stop", "Stop", description="Stop the run and finalize the tracker."),
     ActionSpec(
-        "set_lr",
-        "Set learning rate",
+        "set_lr", "Set learning rate",
         args={"lr": ArgSpec("float", default=1e-3, description="New learning rate")},
         description="Update the optimizer's learning rate live.",
     ),
 ]
+
+# Added only when the controller was constructed with enable_rewind=True.
+REWIND_ACTION = ActionSpec(
+    "rewind", "Rewind to step",
+    args={"step": ArgSpec("int", description="Restore the nearest snapshot at or before this step")},
+    description="Restore model/optimizer/RNG from a snapshot and continue on a new branch.",
+)
+
 
 def write_actions(run_dir: Path, specs: list[ActionSpec]) -> None:
     seen: dict[str, str] = {}
@@ -120,14 +157,13 @@ def write_actions(run_dir: Path, specs: list[ActionSpec]) -> None:
                 f"produce the UI id {spec.html_id!r} -- rename one of them."
             )
         seen[spec.html_id] = spec.name
-
-    payload = [s.to_json() for s in specs]
-    atomic_write(actions_path(run_dir), json.dumps(payload, indent=2))
+    atomic_write(actions_path(run_dir), json.dumps([s.to_json() for s in specs], indent=2))
 
 
 def read_actions(run_dir: Path) -> list[ActionSpec]:
     path = actions_path(run_dir)
-    if not path.exists():
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
         return []
-    payload = json.loads(path.read_text())
     return [ActionSpec.from_json(d) for d in payload]
