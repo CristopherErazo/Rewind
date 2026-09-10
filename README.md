@@ -26,7 +26,7 @@ Track metrics or configs durably: that is your experiment tracker's job. The cor
 git clone https://github.com/CristopherErazo/Rewind
 cd Rewind
 uv sync --extra dashboard     # creates .venv with everything, including pytest
-uv run pytest -q              # 40 tests, about 5 seconds
+uv run pytest -q              # 51 tests, about 5 seconds
 ```
 
 Without `--extra dashboard` you get the core only; the dashboard end-to-end test skips itself.
@@ -52,7 +52,7 @@ uv run shiny run --reload examples/dashboard_attach.py
 Open the printed URL (usually `http://127.0.0.1:8000`). In the sidebar pick experiment `toy` and the run (the "Follow newest run" switch is on by default). Then:
 
 - **Live** tab: `train_loss` and `eval_loss` update as the run goes.
-- **Control** tab: click **Pause**, watch the status bar turn to `paused`, click **Resume**. Set a new learning rate and **Send**. Send **Perturb weights** with a noise scale and watch the loss jump. Type an earlier step into **Rewind to step** and **Send**: the status bar shows a new branch such as `b1@t2400`, the Live plot grows a second colored line, and the loss curve replays.
+- **Control** tab: click **Pause**, watch the status bar turn to `paused`, click **Resume**. Set a new learning rate and **Send**. Send **Perturb weights** with a noise scale and watch the loss jump. Type an earlier step into **Rewind to step** and **Send**: the status bar shows a new branch such as `b1@t2400`, the Live plot grows a second colored line, and the loss curve replays. Snapshots are dense (every 10 steps) only over the last 200 steps and sparse (every 200 steps) before that, so a rewind to step 150 sent at step 400 lands on `b1@t0`, the nearest snapshot at or before the request.
 - **Events** tab: every command, its arguments, each branch fork and each state change, newest first.
 - **Runs** tab: one row per run with the config fields that differ between them.
 
@@ -149,7 +149,7 @@ All whole-file writes are atomic, and the dashboard only polls file sizes and mt
 
 ### Snapshots and branches
 
-Snapshots are CPU copies of model and optimizer state plus torch, python, numpy and CUDA RNG state, kept in a small in-memory ring (every 10 steps, last 20) and on disk through the tracker's artifacts every 200 steps. `rewind` restores the nearest snapshot at or before the requested step, walking back through parent branches if needed, and continues under a new branch id `b<n>@t<step>`. Metric rows carry a `branch_id` tag, so the dashboard plots branches as separate lines.
+Snapshots are CPU copies of model and optimizer state plus torch, python, numpy and CUDA RNG state, kept in a small in-memory ring (every 10 steps, last 20) and on disk through the tracker's artifacts every 200 steps. On disk a snapshot is a plain dict of tensors and scalars (`TrainerState.to_dict()`), so it loads under `torch.load`'s default `weights_only=True`. `rewind` restores the nearest snapshot at or before the requested step, walking back through parent branches if needed, and continues under a new branch id `b<n>@t<step>`. A snapshot at step `S` is always the state *before* anything that happened at `S`: when a handler calls `snapshot_now()` and a scheduled snapshot falls on the same step, the earlier one is kept, so rewinding to the step of an intervention undoes it. Metric rows carry a `branch_id` tag, so the dashboard plots branches as separate lines.
 
 **Determinism contract.** A rewind is exact when every source of randomness in your training step comes from the torch, numpy or python RNGs, which are restored. Anything else with state is not restored yet: an LR scheduler, a `DataLoader` iterator, a `GradScaler`. Those drift after a rewind. State hooks for them are the next milestone.
 

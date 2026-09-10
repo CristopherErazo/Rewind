@@ -29,9 +29,13 @@ class Toy:
         return {"train_loss": loss.item()}
 
     def evaluate(self) -> dict:
+        # Draws from the torch RNG on purpose, like a real eval batch would:
+        # a rewind is only exact if the snapshot precedes this draw.
         with torch.no_grad():
+            x = torch.randn(16, 4)
+            eval_loss = ((self.model(x) - x.sum(dim=1, keepdim=True)) ** 2).mean().item()
             w = self.model.weight.abs().sum().item()
-        return {"weight_l1": w}
+        return {"weight_l1": w, "eval_loss": eval_loss}
 
 
 @pytest.fixture

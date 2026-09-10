@@ -322,6 +322,18 @@ class TrainerController:
             if self._stop:
                 break
 
+            # Snapshot *before* eval: a snapshot at step S is the state before
+            # anything that ran at S. eval_fn may draw from the RNG (the toy
+            # example samples an eval batch), and a snapshot taken after it
+            # would restore a post-eval RNG that the loop then advances again
+            # by re-running eval, so the replayed batches would differ from
+            # the ones the parent branch saw. Commands were applied above, so
+            # a handler's snapshot_now() still comes first (first write wins).
+            if self.snapshots is not None:
+                self.snapshots.maybe_snapshot(
+                    self.step, self.model, self.optimizer, self._current_lr(), self.branch_id,
+                )
+
             if self.eval_fn is not None and self.step in self.eval_schedule:
                 metrics = self.eval_fn()
                 self.run.track_metric(self.step, tags=self._branch_tags(), **metrics)
@@ -329,11 +341,6 @@ class TrainerController:
 
             if self.eval_artifacts_fn is not None and self.step in self.eval_artifacts_schedule:
                 self._log_eval_artifacts(self.eval_artifacts_fn())
-
-            if self.snapshots is not None:
-                self.snapshots.maybe_snapshot(
-                    self.step, self.model, self.optimizer, self._current_lr(), self.branch_id,
-                )
 
             out = self.train_step_fn()
             if (self.train_log_every and isinstance(out, dict) and out
