@@ -1,22 +1,45 @@
 [project]
 name = "rewind"
-version = "0.1.0"
-description = "Small library for turning a training loop into something you can steer while it runs."
+version = "0.2.0"
+description = "Turn a PyTorch training loop into one you can steer while it runs: pause, live hyperparameters, exact rewind with branches."
+readme = "README.md"
 authors = [
-    { name = "Cristopher Erazo", email = "cerazova@sissa.it" }
+    { name = "Cristopher Erazo", email = "cerazova@sissa.it" },
 ]
-dynamic = ["dependencies"] 
+requires-python = ">=3.10"
+dependencies = [
+    "numpy",
+    "torch",
+]
+
+[project.optional-dependencies]
+# The core is tracker-agnostic; the Shiny dashboard is not. It reads runs
+# through TrackLab (pulled from GitHub, see [tool.uv.sources]) and needs the
+# plotting stack. Install with `uv sync --extra dashboard`.
+dashboard = [
+    "tracklab",
+    "shiny>=1.0",
+    "shinywidgets",
+    "plotly",
+    "pandas",
+]
+
+[dependency-groups]
+# Installed by `uv sync` by default. The dashboard end-to-end test skips
+# itself when the dashboard extra is absent.
+dev = ["pytest"]
+
+[tool.uv.sources]
+tracklab = { git = "https://github.com/CristopherErazo/TrackLab" }
+# Working on both repos at once? Point at the sibling checkout instead:
+# tracklab = { path = "../TrackLab", editable = true }
 
 [build-system]
-requires = ["setuptools"]
-build-backend = "setuptools.build_meta"
+requires = ["uv_build>=0.12.3,<0.13.0"]
+build-backend = "uv_build"
 
-[tool.setuptools.packages.find] 
-where = ["."] 
-exclude = ["scripts", "shell","notebooks"] 
+[tool.uv.build-backend]
+module-root = ""  # flat layout: the `rewind/` package lives at the repo root, not under src/
 
-[tool.setuptools.dynamic] 
-dependencies = { file = ["requirements.txt"] } 
-
-[project.optional-dependencies] 
-test = ["pytest"]
+[tool.pytest.ini_options]
+testpaths = ["tests"]
