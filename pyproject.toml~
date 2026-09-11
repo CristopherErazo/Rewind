@@ -1,6 +1,6 @@
 [project]
 name = "rewind"
-version = "1.0.0"
+version = "0.2.0"
 description = "Turn a PyTorch training loop into one you can steer while it runs: pause, live hyperparameters, exact rewind with branches."
 readme = "README.md"
 authors = [
