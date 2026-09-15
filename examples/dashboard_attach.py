@@ -10,4 +10,6 @@ from pathlib import Path
 
 from rewind.dashboard import DashboardConfig, build_dashboard
 
-app = build_dashboard(DashboardConfig(base_dir=Path(__file__).resolve().parent / "data", title="Rewind (toy)"))
+app = build_dashboard(DashboardConfig(base_dir=Path(__file__).resolve().parent / "data", 
+                                      title="Training Dashboard",
+                                      poll_interval_s=0.25))

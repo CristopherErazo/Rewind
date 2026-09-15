@@ -68,6 +68,12 @@ uv run examples/teacher_student.py --steps 5000
 
 It adds three commands with arguments: **Unfreeze layer** and **Freeze layer** (layer 1, 2 or 3) and **Perturb layer** (layer plus noise scale). The `w_norm_1..3` metrics show each layer's weight norm, so you can see which layers move, which are frozen and which one a perturbation hit. Weights are N(0, 1) and every preactivation is `gain * (W x / sqrt(fan_in) + b)`, so activations are order 1 for any width; `--gain` (default 1) sets how nonlinear the network is and `--act` picks ReLU (default) or tanh. Try unfreezing layer 3 alone, then 2, then 1: each step lowers the plateau, because a layer can only re-mix the features the frozen layers before it provide. Sending an invalid layer produces a `failed` event in the Events tab and training continues. The trainable mask is kept in a model buffer, so it is part of every snapshot: rewind to before an unfreeze and the layer is frozen again on the new branch.
 
+## Demonstration
+
+https://github.com/CristopherErazo/Rewind/raw/main/public/demonstration.mp4
+
+*3 layers neural network example*
+
 ## Quick start in your own script
 
 ```python
