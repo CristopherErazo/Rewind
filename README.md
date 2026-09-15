@@ -70,7 +70,7 @@ It adds three commands with arguments: **Unfreeze layer** and **Freeze layer** (
 
 ## Demonstration
 
-https://github.com/CristopherErazo/Rewind/raw/main/public/demonstration.mp4
+<video src="https://github.com/CristopherErazo/Rewind/raw/main/public/demonstration.mp4" controls></video>
 
 *3 layers neural network example*
 
